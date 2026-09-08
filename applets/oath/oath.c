@@ -391,6 +391,19 @@ static int oath_increase_counter(OATH_RECORD *record) {
   return i >= 0 ? 0 : -1;
 }
 
+static uint32_t pow10_u32(int n) {
+  uint32_t r = 1;
+  while (n-- > 0) r *= 10;
+  return r;
+}
+
+static void increase_counter_bytes(uint8_t challenge[MAX_CHALLENGE_LEN]) {
+  for (int i = MAX_CHALLENGE_LEN - 1; i >= 0; i--) {
+    challenge[i]++;
+    if (challenge[i] != 0) break;
+  }
+}
+
 static uint8_t *oath_digest(const OATH_RECORD *record, uint8_t buffer[SHA512_DIGEST_LENGTH],
                             const uint8_t challenge_len, uint8_t challenge[MAX_CHALLENGE_LEN], const bool truncated) {
   uint8_t digest_length;
@@ -548,6 +561,114 @@ static int oath_calculate(const CAPDU *capdu, RAPDU *rapdu) {
   return 0;
 }
 
+// Reverse-HOTP verification: the host computes the current HOTP code and the
+// key checks it on-device using the same 10-step look-ahead window as NK2.
+// Verifying a code never requires PIN validation or a user-presence touch.
+//
+// Two request shapes (CLA=0x00, P1=0x00, P2=0x00):
+//   1. TLV (preferred): 71 <len> <name> (75|76) 04 <code: big-endian uint32>
+//   2. Raw fallback:    LC == 4 with a first byte that is not a TLV tag; the
+//      four bytes are a little-endian uint32 (NK2 otp_code_to_verify layout).
+//      With no name present this resolves to the first HOTP record in the
+//      file, which is what the virt-card replay harness uses.
+//
+// Response (SW=0x9000 on both pass and fail): payload[0]=pass, payload[1]=
+// matched window offset (0..9) on pass, or 0xFE on fail. On pass the stored
+// counter advances by offset+1 in a single persistent write.
+static int oath_verify_code(const CAPDU *capdu, RAPDU *rapdu) {
+  if (P1 != 0x00 || P2 != 0x00) EXCEPT(SW_WRONG_P1P2);
+
+  uint32_t code_to_verify;
+  const uint8_t *name_ptr;
+  uint8_t name_len;
+
+  if (LC == 4 && DATA[0] != OATH_TAG_NAME && DATA[0] != OATH_TAG_FULL_RESPONSE && DATA[0] != OATH_TAG_RESPONSE) {
+    // Raw fallback: bare 4-byte little-endian code, no name.
+    uint32_t raw;
+    memcpy(&raw, DATA, 4);
+    code_to_verify = letoh32(raw);
+    name_ptr = NULL;
+    name_len = 0;
+  } else {
+    // TLV form: parse name tag, then the code tag (0x75/0x76 are aliases).
+    uint16_t offset = 0;
+    if (LC < 2) EXCEPT(SW_WRONG_LENGTH);
+    if (DATA[offset++] != OATH_TAG_NAME) EXCEPT(SW_WRONG_DATA);
+    name_len = DATA[offset++];
+    if (name_len == 0 || name_len > MAX_NAME_LEN) EXCEPT(SW_WRONG_DATA);
+    if (LC < offset + name_len) EXCEPT(SW_WRONG_LENGTH);
+    name_ptr = &DATA[offset];
+    offset += name_len;
+
+    if (LC < offset + 2) EXCEPT(SW_WRONG_LENGTH);
+    if (DATA[offset] != OATH_TAG_FULL_RESPONSE && DATA[offset] != OATH_TAG_RESPONSE) EXCEPT(SW_WRONG_DATA);
+    offset++;
+    if (DATA[offset++] != 4) EXCEPT(SW_WRONG_DATA);
+    if (LC < offset + 4) EXCEPT(SW_WRONG_LENGTH);
+    uint32_t raw;
+    memcpy(&raw, DATA + offset, 4);
+    code_to_verify = be32toh(raw);
+    offset += 4;
+    if (LC != offset) EXCEPT(SW_WRONG_LENGTH);
+  }
+
+  // Resolve the record. The TLV form looks up by name; the raw fallback has
+  // no name, so it resolves to the first HOTP record in the file.
+  OATH_RECORD record;
+  size_t file_offset;
+  if (name_len != 0) {
+    int idx = oath_find_record(name_ptr, name_len, &record, &file_offset);
+    if (idx == -2) return -1;
+    if (idx == -1) EXCEPT(SW_FILE_NOT_FOUND);
+    if ((record.key[0] & OATH_TYPE_MASK) != OATH_TYPE_HOTP) EXCEPT(SW_DATA_INVALID);
+  } else {
+    const int size = get_file_size(OATH_FILE);
+    if (size < 0) return -1;
+    const size_t n_records = size / sizeof(OATH_RECORD);
+    int idx = -1;
+    for (size_t i = 0; i < n_records; ++i) {
+      file_offset = i * sizeof(OATH_RECORD);
+      if (read_file(OATH_FILE, &record, file_offset, sizeof(OATH_RECORD)) < 0) return -1;
+      if (record.name_len != 0 && (record.key[0] & OATH_TYPE_MASK) == OATH_TYPE_HOTP) {
+        idx = (int)i;
+        break;
+      }
+    }
+    if (idx == -1) EXCEPT(SW_FILE_NOT_FOUND);
+  }
+
+  // Scan the NK2 window counter+0 .. counter+9 without mutating the stored
+  // counter: copy it, then increment the copy to challenge+k.
+  uint8_t tmp[MAX_CHALLENGE_LEN];
+  uint8_t hash[SHA512_DIGEST_LENGTH];
+  int matched_offset = -1;
+  for (int k = 0; k < 10; ++k) {
+    memcpy(tmp, record.challenge, sizeof(tmp));
+    for (int j = 0; j < k; ++j) increase_counter_bytes(tmp);
+    uint32_t code;
+    memcpy(&code, oath_digest(&record, hash, sizeof(record.challenge), tmp, true), 4);
+    code = be32toh(code) % pow10_u32(record.key[1]);
+    if (code == code_to_verify) {
+      matched_offset = k;
+      break;
+    }
+  }
+
+  if (matched_offset >= 0) {
+    // Advance the persisted counter to matched+1 in RAM, then write once.
+    for (int i = 0; i <= matched_offset; ++i) oath_increase_counter(&record);
+    if (oath_update_challenge_field(&record, file_offset) < 0) return -1;
+    RDATA[0] = 1;
+    RDATA[1] = (uint8_t)matched_offset;
+  } else {
+    RDATA[0] = 0;
+    RDATA[1] = 0xFE;
+  }
+  LL = 2;
+  SW = SW_NO_ERROR;
+  return 0;
+}
+
 static int oath_calculate_all(const CAPDU *capdu, RAPDU *rapdu) {
   static uint8_t challenge_len;
   static uint8_t challenge[MAX_CHALLENGE_LEN];
@@ -685,7 +806,8 @@ int __attribute__((noinline)) oath_process_apdu(const CAPDU *capdu, RAPDU *rapdu
     return 0;
   }
 
-  if (!is_validated && INS != OATH_INS_SELECT && INS != OATH_INS_VALIDATE) EXCEPT(SW_SECURITY_STATUS_NOT_SATISFIED);
+  if (!is_validated && INS != OATH_INS_SELECT && INS != OATH_INS_VALIDATE && INS != OATH_INS_VERIFY_CODE)
+    EXCEPT(SW_SECURITY_STATUS_NOT_SATISFIED);
 
   int ret;
   switch (INS) {
@@ -710,6 +832,9 @@ int __attribute__((noinline)) oath_process_apdu(const CAPDU *capdu, RAPDU *rapdu
     break;
   case OATH_INS_VALIDATE:
     ret = oath_validate(capdu, rapdu);
+    break;
+  case OATH_INS_VERIFY_CODE:
+    ret = oath_verify_code(capdu, rapdu);
     break;
   case OATH_INS_SELECT:
     if (P1 == 0x04) {
